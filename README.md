@@ -6,8 +6,6 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-alpha-orange.svg)](docs/KNOWN_LIMITATIONS.md)
 
-[الدليل العربي السريع](docs/README.ar.md)
-
 WATCH.21 is a Bash-based orchestration tool that coordinates staged asset
 discovery, URL collection, bounded content discovery, Nuclei candidate
 collection, validation, evidence handling, and reporting. Its primary command
