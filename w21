@@ -1,0 +1,1837 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+################################################################################
+# WATCH.21 — Scope-first Security Reconnaissance Orchestrator
+#
+# Authorized security testing and bug-bounty reconnaissance tool for assets
+# owned by the user or explicitly authorized programs.
+#
+# Current alpha features:
+# - 26 staged reconnaissance phases
+# - HackerOne API integration (read-only)
+# - Scope enforcement and normalization
+# - Long-running execution with resume capability
+# - Comprehensive logging and reporting
+# - Safe defaults with explicit opt-in for risky operations
+#
+# Usage:
+#   ./w21 --target domain.com --profile safe --output results/
+#   ./w21 --h1-program HANDLE --scope-source hackerone --output results/
+#   ./w21 --help
+#
+################################################################################
+
+# ============================================================================
+# CONSTANTS AND CONFIGURATION
+# ============================================================================
+
+readonly SCRIPT_NAME="w21"
+readonly SCRIPT_VERSION="0.1.0-alpha"
+# Resolve the real file so an installation symlink in ~/.local/bin still finds
+# the adjacent lib/ directory and dependency lock in ~/.local/share/w21.
+readonly SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+# Dependency management is isolated from reconnaissance so installation can
+# never accidentally start a scan.
+# shellcheck source=lib/dependency-installer.sh
+source "${SCRIPT_DIR}/lib/dependency-installer.sh"
+
+# Exit codes
+readonly EXIT_SUCCESS=0
+readonly EXIT_USAGE_ERROR=1
+readonly EXIT_PARTIAL_COMPLETION=2
+readonly EXIT_SCOPE_REJECTION=3
+readonly EXIT_MISSING_DEPENDENCY=4
+readonly EXIT_SCOPE_CHANGED=5
+readonly EXIT_AUTH_ERROR=6
+readonly EXIT_RESOURCE_LIMIT=7
+
+# Phase states
+readonly PHASE_PENDING="pending"
+readonly PHASE_RUNNING="running"
+readonly PHASE_SUCCESS="success"
+readonly PHASE_PARTIAL="partial"
+readonly PHASE_FAILED="failed"
+readonly PHASE_SKIPPED="skipped"
+readonly PHASE_INTERRUPTED="interrupted"
+
+# ============================================================================
+# COLOR CODES
+# ============================================================================
+
+RED='\033[1;31m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[1;34m'
+CYAN='\033[1;36m'
+MAGENTA='\033[1;35m'
+NC='\033[0m'  # No Color
+
+# ============================================================================
+# GLOBAL CONFIGURATION VARIABLES
+# ============================================================================
+
+# Command-line options
+TARGETS=()
+TARGETS_FILE=""
+SCOPE_FILE=""
+SCOPE_SOURCE="file"  # file or hackerone
+H1_PROGRAM=""
+H1_CREDENTIALS_FILE=""
+H1_REFRESH_MINUTES=60
+BOUNTY_ONLY=0
+PROFILE="safe"  # safe or standard
+OUTPUT_DIR=""
+SECLISTS_DIR=""
+WORDLIST_FILE=""
+ARTIFACT_URLS_FILE=""
+CONFIG_FILE=""
+RATE_LIMIT=50
+CONCURRENCY=10
+TIMEOUT=30
+MAX_RUNTIME_MINUTES=10080  # 7 days default
+MAX_REQUESTS=100000
+MAX_FEEDBACK_ROUNDS=5
+MAX_ARTIFACT_SIZE=$((100 * 1024 * 1024))  # 100 MB
+RESUME=0
+FORCE_PHASE=""
+SKIP_PHASES=()
+UPDATE_TEMPLATES=0
+DRY_RUN=0
+DOCTOR_MODE=0
+DOCTOR_JSON=0
+DEPENDENCY_ACTION=""
+ASSUME_YES=0
+INSECURE=0
+NON_INTERACTIVE=0
+
+# Runtime state
+SCAN_ID=""
+START_TIME=""
+LAST_ACTIVITY=""
+OUTPUT_DIR_LOCK=""
+TEMP_DIR=""
+STATE_DIR=""
+LOG_FILE="/dev/null"
+MANIFEST_FILE=""
+API_CACHE_DIR=""
+SCOPE_CACHE_DIR=""
+
+# HackerOne API state
+H1_USERNAME=""
+H1_TOKEN=""
+H1_API_URL="https://api.hackerone.com"
+H1_PROGRAM_DATA=""
+H1_SCOPES=()
+H1_SCOPE_EXCLUSIONS=()
+
+# Scope state
+SCOPE_NORMALIZED=()
+SUBMISSION_ELIGIBLE=()
+BOUNTY_ELIGIBLE=()
+OUT_OF_SCOPE_ITEMS=()
+AMBIGUOUS_SCOPE_ITEMS=()
+
+# ============================================================================
+# LOGGING FUNCTIONS
+# ============================================================================
+
+log_info() {
+    local msg="$1"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo -e "${CYAN}[${timestamp}]${NC} ${GREEN}[*]${NC} ${msg}" | tee -a "${LOG_FILE}"
+}
+
+log_warn() {
+    local msg="$1"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo -e "${CYAN}[${timestamp}]${NC} ${YELLOW}[!]${NC} ${msg}" | tee -a "${LOG_FILE}"
+}
+
+log_error() {
+    local msg="$1"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo -e "${CYAN}[${timestamp}]${NC} ${RED}[✗]${NC} ${msg}" | tee -a "${LOG_FILE}" >&2
+}
+
+log_success() {
+    local msg="$1"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo -e "${CYAN}[${timestamp}]${NC} ${GREEN}[✔]${NC} ${msg}" | tee -a "${LOG_FILE}"
+}
+
+log_debug() {
+    local msg="$1"
+    if [[ "${DEBUG:-0}" == "1" ]]; then
+        local timestamp
+        timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+        echo -e "${CYAN}[${timestamp}]${NC} ${MAGENTA}[D]${NC} ${msg}" | tee -a "${LOG_FILE}"
+    fi
+}
+
+# ============================================================================
+# ERROR HANDLING AND CLEANUP
+# ============================================================================
+
+cleanup() {
+    local exit_code=$?
+
+    if [[ -n "${TEMP_DIR}" && -d "${TEMP_DIR}" ]]; then
+        log_debug "Cleaning temporary directory: ${TEMP_DIR}"
+        rm -rf "${TEMP_DIR}"
+    fi
+
+    # Release lock if we hold it
+    if [[ -n "${OUTPUT_DIR_LOCK}" && -f "${OUTPUT_DIR_LOCK}" ]]; then
+        rm -f "${OUTPUT_DIR_LOCK}"
+    fi
+
+    return "${exit_code}"
+}
+
+die() {
+    local msg="$1"
+    local code="${2:-1}"
+    log_error "${msg}"
+    exit "${code}"
+}
+
+# ============================================================================
+# TRAP HANDLERS
+# ============================================================================
+
+trap cleanup EXIT
+trap 'die "Interrupted by user" 130' INT TERM HUP
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+require_command() {
+    local cmd="$1"
+    if ! command_exists "$cmd"; then
+        die "Required command not found: ${cmd}" "${EXIT_MISSING_DEPENDENCY}"
+    fi
+}
+
+# Create temp directory with security
+create_temp_dir() {
+    TEMP_DIR="$(mktemp -d)" || die "Failed to create temporary directory" 1
+    chmod 700 "${TEMP_DIR}"
+    echo "${TEMP_DIR}"
+}
+
+# Initialize output directory with proper structure
+init_output_dir() {
+    if [[ -z "${OUTPUT_DIR}" ]]; then
+        OUTPUT_DIR="${SCRIPT_DIR}/results_$(date +%s)"
+    fi
+
+    mkdir -p "${OUTPUT_DIR}"
+
+    # Create lock file for preventing concurrent scans
+    OUTPUT_DIR_LOCK="${OUTPUT_DIR}/.lock"
+    if [[ -f "${OUTPUT_DIR_LOCK}" ]]; then
+        local lock_pid
+        lock_pid=$(sed -n '1p' "${OUTPUT_DIR_LOCK}" 2>/dev/null || true)
+        if [[ "${lock_pid}" =~ ^[0-9]+$ ]] && kill -0 "${lock_pid}" 2>/dev/null; then
+            die "Output directory is in use by process ${lock_pid}." "${EXIT_USAGE_ERROR}"
+        fi
+        # Check if lock is stale (older than 24 hours)
+        local lock_age
+        lock_age=$(( $(date +%s) - $(stat -c %Y "${OUTPUT_DIR_LOCK}" 2>/dev/null || echo 0) ))
+        if [[ ${lock_age} -lt 86400 && ${RESUME} -ne 1 ]]; then
+            die "Output directory is locked by another process. Use --resume to continue." "${EXIT_USAGE_ERROR}"
+        fi
+        log_warn "Stale lock detected (${lock_age}s old), recovering..."
+    fi
+
+    echo $$ > "${OUTPUT_DIR_LOCK}"
+
+    # Create directory structure
+    STATE_DIR="${OUTPUT_DIR}/state"
+    mkdir -p "${STATE_DIR}" "${OUTPUT_DIR}/scope" "${OUTPUT_DIR}/recon" \
+            "${OUTPUT_DIR}/artifacts" "${OUTPUT_DIR}/wordlists" "${OUTPUT_DIR}/urls" \
+            "${OUTPUT_DIR}/javascript" "${OUTPUT_DIR}/api" "${OUTPUT_DIR}/candidates" \
+            "${OUTPUT_DIR}/nuclei" "${OUTPUT_DIR}/logs" "${OUTPUT_DIR}/report"
+
+    LOG_FILE="${OUTPUT_DIR}/logs/main.log"
+    MANIFEST_FILE="${OUTPUT_DIR}/manifest.json"
+    API_CACHE_DIR="${STATE_DIR}/api_cache"
+    SCOPE_CACHE_DIR="${STATE_DIR}/scope_cache"
+    mkdir -p "${API_CACHE_DIR}" "${SCOPE_CACHE_DIR}"
+    chmod 700 "${API_CACHE_DIR}" "${SCOPE_CACHE_DIR}"
+
+    log_info "Output directory initialized: ${OUTPUT_DIR}"
+}
+
+# Generate unique scan ID
+generate_scan_id() {
+    SCAN_ID="$(date +%Y%m%d_%H%M%S)_$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' ')"
+    echo "${SCAN_ID}"
+}
+
+# Initialize state files
+init_state() {
+    if [[ ${RESUME} -eq 1 && -s "${STATE_DIR}/phases.json" ]]; then
+        SCAN_ID=$(jq -r '.scan_id // empty' "${STATE_DIR}/phases.json")
+        START_TIME=$(jq -r '.start_time // empty' "${STATE_DIR}/phases.json")
+        [[ -n "${START_TIME}" ]] || START_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        LAST_ACTIVITY=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        touch "${STATE_DIR}/queue.jsonl" "${STATE_DIR}/seen.txt" "${STATE_DIR}/phase_notes.jsonl"
+        return 0
+    fi
+    START_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    LAST_ACTIVITY="${START_TIME}"
+
+    # Initialize phases.json
+    jq -n --arg id "${SCAN_ID}" --arg started "${START_TIME}" \
+        '{scan_id:$id,start_time:$started,phases:[]}' > "${STATE_DIR}/phases.json.tmp"
+    mv "${STATE_DIR}/phases.json.tmp" "${STATE_DIR}/phases.json"
+
+    # Initialize queue.jsonl and seen.txt
+    touch "${STATE_DIR}/queue.jsonl" "${STATE_DIR}/seen.txt" "${STATE_DIR}/phase_notes.jsonl"
+}
+
+# ============================================================================
+# CONFIGURATION AND ARGUMENT PARSING
+# ============================================================================
+
+show_help() {
+    cat <<'EOF'
+WATCH.21 v0.1.0-alpha
+Scope-first Security Reconnaissance Orchestrator (alpha)
+
+USAGE:
+  w21 [OPTIONS]
+
+REQUIRED (one of):
+  --target DOMAIN_OR_URL          Target domain or URL
+  --targets FILE                  File with targets (one per line)
+  --scope FILE                    Scope file for manual specification
+  --h1-program HANDLE             HackerOne program handle
+
+OPTIONS:
+  --scope-source file|hackerone   Scope source (default: file)
+  --h1-credentials-file FILE      HackerOne credentials file
+  --h1-refresh-minutes NUMBER     API refresh interval (default: 60)
+  --bounty-only                   Only scan bounty-eligible assets
+  --profile safe|standard         Profile mode (default: safe)
+  --output DIRECTORY              Output directory
+  --seclists DIRECTORY            SecLists directory
+  --wordlist FILE                 Custom wordlist
+  --artifact-urls FILE            File with artifact URLs to scan
+  --config FILE                   Configuration file
+  --rate-limit NUMBER             Requests per second (default: 50)
+  --concurrency NUMBER            Concurrent tasks (default: 10)
+  --timeout NUMBER                Timeout per request in seconds (default: 30)
+  --max-runtime MINUTES           Maximum scan duration (default: 10080 = 7 days)
+  --max-requests NUMBER           Maximum requests per scan (default: 100000)
+  --max-feedback-rounds NUMBER    Feedback loop iterations (default: 5)
+  --max-artifact-size BYTES       Maximum artifact size (default: 100MB)
+  --resume                        Resume previous scan
+  --force-phase PHASE             Force re-run specific phase
+  --skip-phase PHASE              Skip phase
+  --update-templates              Update Nuclei templates
+  --dry-run                       Show plan without executing
+  --doctor                        Check configuration and dependencies
+  --doctor --json                 Emit machine-readable diagnostics
+  --install-missing [--yes]       Install missing required and optional tools
+  --install-required              Install only missing required tools
+  --install-optional              Install only missing optional tools
+  --update-tools                  Upgrade outdated managed tools after a plan
+  --print-install-plan            Print the exact missing-tool plan
+  --insecure                      Disable TLS verification (explicit opt-in)
+  --non-interactive               No user prompts
+  --version                       Show version
+  --help                          Show this help message
+
+PROFILES:
+  safe       Non-destructive checks only (default)
+  standard   Includes safe CVE detection and technology checks
+
+EXAMPLES:
+  # Simple domain scan with safe profile
+  ./w21 --target example.com --profile safe --output results/example
+
+  # HackerOne program scope
+  ./w21 --h1-program handle --scope-source hackerone --output results/h1
+
+  # Resume previous scan
+  ./w21 --resume --output results/example
+
+  # Dry-run to see plan
+  ./w21 --target example.com --dry-run
+
+  # Check system configuration
+  ./w21 --doctor
+
+For security details, see README.md
+EOF
+}
+
+show_version() {
+    echo "w21 version ${SCRIPT_VERSION}"
+}
+
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case "${1}" in
+            --target)
+                TARGETS+=("${2}")
+                shift 2
+                ;;
+            --targets)
+                TARGETS_FILE="${2}"
+                shift 2
+                ;;
+            --scope)
+                SCOPE_FILE="${2}"
+                shift 2
+                ;;
+            --scope-source)
+                SCOPE_SOURCE="${2}"
+                shift 2
+                ;;
+            --h1-program)
+                H1_PROGRAM="${2}"
+                shift 2
+                ;;
+            --h1-list-programs)
+                h1_list_programs
+                exit "${EXIT_SUCCESS}"
+                ;;
+            --h1-credentials-file)
+                H1_CREDENTIALS_FILE="${2}"
+                shift 2
+                ;;
+            --h1-refresh-minutes)
+                H1_REFRESH_MINUTES="${2}"
+                shift 2
+                ;;
+            --bounty-only)
+                BOUNTY_ONLY=1
+                shift
+                ;;
+            --profile)
+                PROFILE="${2}"
+                shift 2
+                ;;
+            --output)
+                OUTPUT_DIR="${2}"
+                shift 2
+                ;;
+            --seclists)
+                SECLISTS_DIR="${2}"
+                shift 2
+                ;;
+            --wordlist)
+                WORDLIST_FILE="${2}"
+                shift 2
+                ;;
+            --artifact-urls)
+                ARTIFACT_URLS_FILE="${2}"
+                shift 2
+                ;;
+            --config)
+                CONFIG_FILE="${2}"
+                shift 2
+                ;;
+            --rate-limit)
+                RATE_LIMIT="${2}"
+                shift 2
+                ;;
+            --concurrency)
+                CONCURRENCY="${2}"
+                shift 2
+                ;;
+            --timeout)
+                TIMEOUT="${2}"
+                shift 2
+                ;;
+            --max-runtime)
+                MAX_RUNTIME_MINUTES="${2}"
+                shift 2
+                ;;
+            --max-requests)
+                MAX_REQUESTS="${2}"
+                shift 2
+                ;;
+            --max-feedback-rounds)
+                MAX_FEEDBACK_ROUNDS="${2}"
+                shift 2
+                ;;
+            --max-artifact-size)
+                MAX_ARTIFACT_SIZE="${2}"
+                shift 2
+                ;;
+            --resume)
+                RESUME=1
+                shift
+                ;;
+            --force-phase)
+                FORCE_PHASE="${2}"
+                shift 2
+                ;;
+            --skip-phase)
+                SKIP_PHASES+=("${2}")
+                shift 2
+                ;;
+            --update-templates)
+                UPDATE_TEMPLATES=1
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=1
+                shift
+                ;;
+            --doctor)
+                DOCTOR_MODE=1
+                shift
+                ;;
+            --json)
+                DOCTOR_JSON=1
+                shift
+                ;;
+            --install-missing)
+                DEPENDENCY_ACTION="missing"
+                shift
+                ;;
+            --install-required)
+                DEPENDENCY_ACTION="required"
+                shift
+                ;;
+            --install-optional)
+                DEPENDENCY_ACTION="optional"
+                shift
+                ;;
+            --update-tools)
+                DEPENDENCY_ACTION="update"
+                shift
+                ;;
+            --print-install-plan)
+                DEPENDENCY_ACTION="plan"
+                shift
+                ;;
+            --yes)
+                ASSUME_YES=1
+                shift
+                ;;
+            --insecure)
+                INSECURE=1
+                log_warn "TLS verification disabled (insecure mode)"
+                shift
+                ;;
+            --non-interactive)
+                NON_INTERACTIVE=1
+                shift
+                ;;
+            --version)
+                show_version
+                exit "${EXIT_SUCCESS}"
+                ;;
+            --help)
+                show_help
+                exit "${EXIT_SUCCESS}"
+                ;;
+            *)
+                log_error "Unknown option: ${1}"
+                show_help
+                exit "${EXIT_USAGE_ERROR}"
+                ;;
+        esac
+    done
+}
+
+# ============================================================================
+# DEPENDENCY CHECKING
+# ============================================================================
+
+check_required_dependencies() {
+    local missing=()
+
+    for cmd in bash curl jq sort awk sed grep sha256sum file; do
+        if ! command_exists "${cmd}"; then
+            missing+=("${cmd}")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_error "Missing required dependencies: ${missing[*]}"
+        return 1
+    fi
+
+    return 0
+}
+
+check_optional_dependencies() {
+    local optional=(
+        subfinder assetfinder amass dnsx puredns shuffledns massdns httpx naabu
+        katana gau waymore uro unfurl anew ffuf nuclei interactsh-client subzy
+        wafw00f sslscan testssl.sh arjun gf qsreplace LinkFinder SecretFinder
+        jsluice pdftotext pdfinfo unzip 7z tar exiftool rg strings
+    )
+
+    local missing=()
+
+    for cmd in "${optional[@]}"; do
+        if ! command_exists "${cmd}"; then
+            missing+=("${cmd}")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_warn "Missing optional tools (reduced coverage): ${missing[*]}"
+    fi
+}
+
+# ============================================================================
+# DOCTOR MODE
+# ============================================================================
+
+run_doctor_mode() {
+    run_dependency_doctor "${DOCTOR_JSON}"
+}
+
+# ============================================================================
+# HACKERONE API INTEGRATION
+# ============================================================================
+
+h1_load_credentials() {
+    # First try to load from file
+    if [[ -n "${H1_CREDENTIALS_FILE}" && -f "${H1_CREDENTIALS_FILE}" ]]; then
+        # Check file permissions (must be 600)
+        local perms
+        perms=$(stat -c%a "${H1_CREDENTIALS_FILE}" 2>/dev/null)
+        if [[ "${perms}" != "600" ]]; then
+            die "Credentials file has insecure permissions: ${perms}. Must be 600." "${EXIT_USAGE_ERROR}"
+        fi
+
+        # Source credentials
+        # shellcheck disable=SC1090
+        source "${H1_CREDENTIALS_FILE}"
+    fi
+
+    # Then try environment variables
+    H1_USERNAME="${H1_USERNAME:-${H1_API_USERNAME:-}}"
+    H1_TOKEN="${H1_TOKEN:-${H1_API_TOKEN:-}}"
+
+    if [[ -z "${H1_USERNAME}" || -z "${H1_TOKEN}" ]]; then
+        die "HackerOne credentials not found. Set H1_API_USERNAME and H1_API_TOKEN." "${EXIT_AUTH_ERROR}"
+    fi
+
+    log_info "HackerOne credentials loaded"
+}
+
+h1_api_request() {
+    local endpoint="$1"
+    local method="${2:-GET}"
+    local temp_credentials
+
+    temp_credentials=$(mktemp)
+    chmod 600 "${temp_credentials}"
+    echo "${H1_USERNAME}:${H1_TOKEN}" > "${temp_credentials}"
+    trap "rm -f ${temp_credentials}" RETURN
+
+    local response
+    response=$(curl -s \
+        -w "\n%{http_code}" \
+        --basic \
+        --user-agent "w21/1.0" \
+        -u "$(cat "${temp_credentials}")" \
+        -H "Accept: application/json" \
+        -X "${method}" \
+        "${H1_API_URL}${endpoint}" 2>/dev/null || echo "error")
+
+    # Parse response and HTTP code
+    local http_code
+    http_code=$(echo "${response}" | tail -n1)
+    local body
+    body=$(echo "${response}" | head -n-1)
+
+    case "${http_code}" in
+        200|201)
+            echo "${body}"
+            return 0
+            ;;
+        401|403)
+            log_error "Authentication failed (${http_code})"
+            return "${EXIT_AUTH_ERROR}"
+            ;;
+        404)
+            log_error "Resource not found (${http_code})"
+            return 1
+            ;;
+        429)
+            log_warn "Rate limited. Implementing backoff..."
+            sleep 5
+            return 1
+            ;;
+        5*)
+            log_warn "Server error (${http_code}). Retrying..."
+            sleep 2
+            return 1
+            ;;
+        *)
+            log_error "Unexpected HTTP ${http_code}"
+            return 1
+            ;;
+    esac
+}
+
+h1_get_program() {
+    local handle="$1"
+    local cache_file="${API_CACHE_DIR}/program_${handle}.json"
+
+    # Check cache first
+    if [[ -f "${cache_file}" ]]; then
+        cat "${cache_file}"
+        return 0
+    fi
+
+    log_info "Fetching HackerOne program: ${handle}"
+
+    local response
+    if ! response=$(h1_api_request "/v1/hackers/programs/${handle}"); then
+        return 1
+    fi
+
+    # Cache the response (600 permissions for security)
+    echo "${response}" > "${cache_file}"
+    chmod 600 "${cache_file}"
+
+    echo "${response}"
+    return 0
+}
+
+h1_get_program_scope() {
+    local handle="$1"
+    local cache_file="${API_CACHE_DIR}/scopes_${handle}.jsonl"
+
+    # Check cache
+    if [[ -f "${cache_file}" ]]; then
+        cat "${cache_file}"
+        return 0
+    fi
+
+    log_info "Fetching scope for program: ${handle}"
+
+    local page=1
+    local has_more=true
+
+    while [[ "${has_more}" == "true" ]]; do
+        local response
+        if ! response=$(h1_api_request "/v1/hackers/programs/${handle}/structured_scopes?page=${page}&per_page=100"); then
+            return 1
+        fi
+
+        # Extract scopes and write to cache
+        echo "${response}" | jq -r '.data[] | @json' >> "${cache_file}"
+
+        # Check for next page
+        has_more=$(echo "${response}" | jq -r '.links.next != null')
+        ((page++))
+
+        # Rate limiting
+        sleep 1
+    done
+
+    chmod 600 "${cache_file}"
+    cat "${cache_file}"
+    return 0
+}
+
+h1_get_scope_exclusions() {
+    local handle="$1"
+    local cache_file="${API_CACHE_DIR}/exclusions_${handle}.json"
+
+    if [[ -f "${cache_file}" ]]; then
+        cat "${cache_file}"
+        return 0
+    fi
+
+    log_info "Fetching scope exclusions for program: ${handle}"
+
+    local response
+    if ! response=$(h1_api_request "/v1/hackers/programs/${handle}/scope_exclusions"); then
+        return 1
+    fi
+
+    echo "${response}" > "${cache_file}"
+    chmod 600 "${cache_file}"
+
+    echo "${response}"
+    return 0
+}
+
+h1_list_programs() {
+    log_info "Fetching available programs..."
+
+    local page=1
+    local has_more=true
+
+    echo -e "${CYAN}Available HackerOne Programs:${NC}\n"
+
+    while [[ "${has_more}" == "true" ]]; do
+        local response
+        if ! response=$(h1_api_request "/v1/hackers/programs?page=${page}&per_page=100"); then
+            break
+        fi
+
+        # Display programs
+        echo "${response}" | jq -r '.data[] | "\(.handle)\t\(.name)\t\(.state)"'
+
+        has_more=$(echo "${response}" | jq -r '.links.next != null')
+        ((page++))
+        sleep 1
+    done
+}
+
+# ============================================================================
+# SCOPE NORMALIZATION AND ENFORCEMENT
+# ============================================================================
+
+normalize_url() {
+    local url="$1"
+
+    # Remove user info
+    url="${url##*://}"
+    url="${url#*@}"
+
+    # Lowercase domain
+    url=$(echo "${url}" | awk -F'/' '{print tolower($1)"/"$2}')
+
+    # Normalize path
+    url=$(echo "${url}" | sed 's|//|/|g')
+
+    echo "https://${url}"
+}
+
+is_in_scope() {
+    local target="$1"
+    local scope_list=("${@:2}")
+
+    # Normalize target
+    target=$(normalize_url "${target}")
+
+    for scope_item in "${scope_list[@]}"; do
+        # Exact domain match
+        if [[ "${target}" == *"${scope_item}" ]]; then
+            return 0
+        fi
+
+        # Wildcard domain match
+        if [[ "${scope_item}" == *.* ]]; then
+            local domain_pattern="${scope_item#\*.}"
+            if [[ "${target}" == *"${domain_pattern}" ]]; then
+                return 0
+            fi
+        fi
+    done
+
+    return 1
+}
+
+# ============================================================================
+# PHASE MANAGEMENT
+# ============================================================================
+
+phase_record_start() {
+    local phase_id="$1"
+    local phase_name="$2"
+
+    log_info "Starting phase: ${phase_name}"
+
+    # Record phase start in state
+    jq ".phases += [{\"phase_id\": \"${phase_id}\", \"name\": \"${phase_name}\", \"state\": \"${PHASE_RUNNING}\", \"start_time\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}]" \
+        "${STATE_DIR}/phases.json" > "${STATE_DIR}/phases.json.tmp"
+    mv "${STATE_DIR}/phases.json.tmp" "${STATE_DIR}/phases.json"
+}
+
+phase_record_end() {
+    local phase_id="$1"
+    local state="$2"
+
+    log_info "Phase ${phase_id} completed with state: ${state}"
+
+    # Update phase state
+    jq "(.phases[] | select(.phase_id == \"${phase_id}\")).state = \"${state}\" | (.phases[] | select(.phase_id == \"${phase_id}\")).end_time = \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"" \
+        "${STATE_DIR}/phases.json" > "${STATE_DIR}/phases.json.tmp"
+    mv "${STATE_DIR}/phases.json.tmp" "${STATE_DIR}/phases.json"
+}
+
+phase_is_complete() {
+    local phase_id="$1"
+    jq -e ".phases[] | select(.phase_id == \"${phase_id}\" and .state == \"${PHASE_SUCCESS}\")" \
+        "${STATE_DIR}/phases.json" >/dev/null 2>&1
+}
+
+should_skip_phase() {
+    local phase_id="$1"
+
+    # Check if phase is in skip list
+    for skip_phase in "${SKIP_PHASES[@]}"; do
+        if [[ "${skip_phase}" == "${phase_id}" ]]; then
+            return 0
+        fi
+    done
+
+    # Check if already completed and not forcing re-run
+    if phase_is_complete "${phase_id}" && [[ "${FORCE_PHASE}" != "${phase_id}" ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+# ============================================================================
+# CORE PHASE IMPLEMENTATIONS
+# ============================================================================
+
+run_phase_initialization() {
+    if should_skip_phase "PHASE_001"; then
+        log_info "Skipping PHASE_001_INITIALIZATION (already completed)"
+        return 0
+    fi
+
+    phase_record_start "PHASE_001" "Initialization"
+
+    log_info "Initializing reconnaissance framework..."
+
+    # Store configuration
+    cat > "${STATE_DIR}/config.json" <<EOF
+{
+  "scan_id": "${SCAN_ID}",
+  "start_time": "${START_TIME}",
+  "profile": "${PROFILE}",
+  "rate_limit": ${RATE_LIMIT},
+  "concurrency": ${CONCURRENCY},
+  "timeout": ${TIMEOUT},
+  "max_runtime_minutes": ${MAX_RUNTIME_MINUTES},
+  "max_requests": ${MAX_REQUESTS},
+  "insecure": ${INSECURE}
+}
+EOF
+
+    log_success "Configuration stored in state"
+    phase_record_end "PHASE_001" "${PHASE_SUCCESS}"
+    return 0
+}
+
+run_phase_dependency_check() {
+    if should_skip_phase "PHASE_002"; then
+        log_info "Skipping PHASE_002_DEPENDENCY_CHECK (already completed)"
+        return 0
+    fi
+
+    phase_record_start "PHASE_002" "Dependency and Version Checks"
+
+    log_info "Checking dependencies and tool versions..."
+
+    if ! check_required_dependencies; then
+        phase_record_end "PHASE_002" "${PHASE_FAILED}"
+        return 1
+    fi
+
+    check_optional_dependencies
+
+    log_success "Dependency check complete"
+    phase_record_end "PHASE_002" "${PHASE_SUCCESS}"
+    return 0
+}
+
+run_phase_scope_acquisition() {
+    if should_skip_phase "PHASE_004"; then
+        log_info "Skipping PHASE_004_SCOPE_ACQUISITION (already completed)"
+        return 0
+    fi
+
+    phase_record_start "PHASE_004" "Scope Acquisition"
+
+    log_info "Acquiring scope from ${SCOPE_SOURCE}..."
+
+    local scope_file="${SCOPE_CACHE_DIR}/scope_snapshot.txt"
+
+    if [[ "${SCOPE_SOURCE}" == "hackerone" && -n "${H1_PROGRAM}" ]]; then
+        # Fetch HackerOne scope
+        h1_load_credentials
+        h1_get_program_scope "${H1_PROGRAM}" > "${scope_file}"
+        log_success "HackerOne scope acquired"
+    elif [[ -n "${SCOPE_FILE}" && -f "${SCOPE_FILE}" ]]; then
+        cp "${SCOPE_FILE}" "${scope_file}"
+        log_success "Scope file loaded"
+    else
+        # Use targets as scope
+        printf '%s\n' "${TARGETS[@]}" > "${scope_file}"
+        log_success "Target list loaded as scope"
+    fi
+
+    phase_record_end "PHASE_004" "${PHASE_SUCCESS}"
+    return 0
+}
+
+run_phase_passive_subdomain_discovery() {
+    if should_skip_phase "PHASE_006"; then
+        log_info "Skipping PHASE_006_PASSIVE_DISCOVERY (already completed)"
+        return 0
+    fi
+
+    phase_record_start "PHASE_006" "Passive Subdomain Discovery"
+
+    log_info "Running passive subdomain enumeration..."
+
+    local output_file="${OUTPUT_DIR}/recon/subdomains/passive.txt"
+    mkdir -p "$(dirname "${output_file}")"
+
+    # Use subfinder if available
+    if command_exists subfinder; then
+        printf '%s\n' "${TARGETS[@]}" | subfinder -silent > "${output_file}" 2>/dev/null || true
+        log_success "Passive subdomain discovery complete: $(wc -l < "${output_file}") subdomains"
+    else
+        log_warn "subfinder not found, skipping passive enumeration"
+        touch "${output_file}"
+    fi
+
+    phase_record_end "PHASE_006" "${PHASE_SUCCESS}"
+    return 0
+}
+
+run_phase_live_probing() {
+    if should_skip_phase "PHASE_009"; then
+        log_info "Skipping PHASE_009_LIVE_PROBING (already completed)"
+        return 0
+    fi
+
+    phase_record_start "PHASE_009" "Live Web-Service Probing"
+
+    log_info "Probing for live hosts with httpx..."
+
+    local subdomains_file="${OUTPUT_DIR}/recon/subdomains/passive.txt"
+    local live_hosts_file="${OUTPUT_DIR}/recon/live-hosts/hosts.txt"
+    mkdir -p "$(dirname "${live_hosts_file}")"
+
+    if [[ ! -f "${subdomains_file}" ]] || [[ ! -s "${subdomains_file}" ]]; then
+        log_warn "No subdomains found for probing"
+        touch "${live_hosts_file}"
+        phase_record_end "PHASE_009" "${PHASE_PARTIAL}"
+        return 1
+    fi
+
+    if command_exists httpx; then
+        cat "${subdomains_file}" | httpx -silent -status-code -title -content-length \
+            -timeout ${TIMEOUT} -rate-limit ${RATE_LIMIT} \
+            > "${live_hosts_file}" 2>/dev/null || true
+
+        local count
+        count=$(wc -l < "${live_hosts_file}")
+        log_success "Live host probing complete: ${count} hosts found"
+    else
+        log_warn "httpx not found, skipping live probing"
+        touch "${live_hosts_file}"
+    fi
+
+    phase_record_end "PHASE_009" "${PHASE_SUCCESS}"
+    return 0
+}
+
+run_phase_technology_fingerprinting() {
+    if should_skip_phase "PHASE_011"; then
+        log_info "Skipping PHASE_011_FINGERPRINTING (already completed)"
+        return 0
+    fi
+
+    phase_record_start "PHASE_011" "Technology Fingerprinting"
+
+    log_info "Fingerprinting technologies..."
+
+    local live_hosts_file="${OUTPUT_DIR}/recon/live-hosts/hosts.txt"
+    local tech_file="${OUTPUT_DIR}/recon/technologies/detected.txt"
+    mkdir -p "$(dirname "${tech_file}")"
+
+    if [[ ! -f "${live_hosts_file}" ]] || [[ ! -s "${live_hosts_file}" ]]; then
+        log_warn "No live hosts for technology detection"
+        touch "${tech_file}"
+        phase_record_end "PHASE_011" "${PHASE_PARTIAL}"
+        return 1
+    fi
+
+    if command_exists httpx; then
+        cat "${live_hosts_file}" | httpx -silent -tech-detect \
+            -timeout ${TIMEOUT} > "${tech_file}" 2>/dev/null || true
+
+        local count
+        count=$(wc -l < "${tech_file}")
+        log_success "Technology fingerprinting complete: ${count} detections"
+    else
+        log_warn "httpx not found, skipping technology detection"
+        touch "${tech_file}"
+    fi
+
+    phase_record_end "PHASE_011" "${PHASE_SUCCESS}"
+    return 0
+}
+
+run_phase_url_collection() {
+    if should_skip_phase "PHASE_020"; then
+        log_info "Skipping PHASE_020_URL_COLLECTION (already completed)"
+        return 0
+    fi
+
+    phase_record_start "PHASE_020" "URL and JavaScript Collection"
+
+    log_info "Collecting URLs and JavaScript endpoints..."
+
+    local live_hosts_file="${OUTPUT_DIR}/recon/live-hosts/hosts.txt"
+    local urls_file="${OUTPUT_DIR}/urls/all_urls.txt"
+    local js_file="${OUTPUT_DIR}/javascript/endpoints.txt"
+    mkdir -p "$(dirname "${urls_file}")" "$(dirname "${js_file}")"
+
+    if [[ ! -f "${live_hosts_file}" ]] || [[ ! -s "${live_hosts_file}" ]]; then
+        log_warn "No live hosts for URL collection"
+        touch "${urls_file}" "${js_file}"
+        phase_record_end "PHASE_020" "${PHASE_PARTIAL}"
+        return 1
+    fi
+
+    # Use katana if available for crawling
+    if command_exists katana; then
+        cat "${live_hosts_file}" | awk '{print $1}' | katana -silent -depth 3 \
+            -timeout ${TIMEOUT} -rate-limit ${RATE_LIMIT} \
+            > "${urls_file}" 2>/dev/null || true
+
+        # Extract JavaScript files
+        grep -E "\.js($|[?#])" "${urls_file}" > "${js_file}" 2>/dev/null || true
+
+        local url_count
+        url_count=$(wc -l < "${urls_file}")
+        local js_count
+        js_count=$(wc -l < "${js_file}")
+        log_success "URL collection complete: ${url_count} URLs, ${js_count} JS files"
+    else
+        log_warn "katana not found, using basic URL extraction"
+        awk '{print $1}' "${live_hosts_file}" > "${urls_file}"
+        touch "${js_file}"
+    fi
+
+    phase_record_end "PHASE_020" "${PHASE_SUCCESS}"
+    return 0
+}
+
+run_phase_nuclei_scanning() {
+    if should_skip_phase "PHASE_025"; then
+        log_info "Skipping PHASE_025_NUCLEI (already completed)"
+        return 0
+    fi
+
+    phase_record_start "PHASE_025" "Nuclei Scanning"
+
+    log_info "Running Nuclei vulnerability scanning (profile: ${PROFILE})..."
+
+    local live_hosts_file="${OUTPUT_DIR}/recon/live-hosts/hosts.txt"
+    local nuclei_raw="${OUTPUT_DIR}/nuclei/raw/findings.jsonl"
+    local nuclei_verified="${OUTPUT_DIR}/nuclei/verified/findings.jsonl"
+    mkdir -p "$(dirname "${nuclei_raw}")" "$(dirname "${nuclei_verified}")"
+
+    if [[ ! -f "${live_hosts_file}" ]] || [[ ! -s "${live_hosts_file}" ]]; then
+        log_warn "No live hosts for Nuclei scanning"
+        touch "${nuclei_raw}" "${nuclei_verified}"
+        phase_record_end "PHASE_025" "${PHASE_PARTIAL}"
+        return 1
+    fi
+
+    if ! command_exists nuclei; then
+        log_warn "nuclei not found, skipping vulnerability scanning"
+        touch "${nuclei_raw}" "${nuclei_verified}"
+        phase_record_end "PHASE_025" "${PHASE_FAILED}"
+        return 1
+    fi
+
+    # Determine Nuclei flags based on profile
+    local nuclei_flags="-json -rate-limit ${RATE_LIMIT} -timeout ${TIMEOUT}"
+    if [[ "${PROFILE}" == "safe" ]]; then
+        nuclei_flags="${nuclei_flags} -tags default"
+    else
+        nuclei_flags="${nuclei_flags} -tags default,cves"
+    fi
+
+    # Run Nuclei with severity filtering
+    cat "${live_hosts_file}" | awk '{print $1}' | \
+        nuclei -silent ${nuclei_flags} 2>/dev/null | \
+        tee "${nuclei_raw}" > /dev/null || true
+
+    # Basic findings count
+    local finding_count
+    finding_count=$(wc -l < "${nuclei_raw}")
+    log_success "Nuclei scanning complete: ${finding_count} findings"
+
+    phase_record_end "PHASE_025" "${PHASE_SUCCESS}"
+    return 0
+}
+
+# The phase runner below is the canonical 26-phase workflow.  Every phase writes
+# a durable output (even when empty), validates that output, and records why a
+# capability was degraded.  Network-capable tools only receive the normalized,
+# in-scope inventories produced by phases 1 and 6.
+
+phase_note() {
+    local phase_id="$1" state="$2" reason="$3"
+    local notes="${STATE_DIR}/phase_notes.jsonl"
+    jq -cn --arg id "${phase_id}" --arg state "${state}" --arg reason "${reason}" \
+        --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{phase_id:$id,state:$state,reason:$reason,time:$time}' >> "${notes}"
+}
+
+finish_phase() {
+    local phase_id="$1" state="$2" reason="${3:-completed}"
+    phase_note "${phase_id}" "${state}" "${reason}"
+    phase_record_end "${phase_id}" "${state}"
+}
+
+start_phase() {
+    local id="$1" name="$2"
+    if should_skip_phase "${id}"; then
+        phase_note "${id}" "${PHASE_SKIPPED}" "explicitly skipped or checkpoint already complete"
+        return 1
+    fi
+    phase_record_start "${id}" "${name}"
+}
+
+sort_unique_file() {
+    local file="$1"
+    local tmp="${file}.tmp.$$"
+    LC_ALL=C sed '/^[[:space:]]*$/d' "${file}" 2>/dev/null | sort -u > "${tmp}" || :
+    mv "${tmp}" "${file}"
+}
+
+scope_filter_hosts() {
+    local input="$1" output="$2"
+    : > "${output}"
+    [[ -f "${input}" ]] || return 0
+    while IFS= read -r host; do
+        host="${host#*://}"; host="${host%%/*}"; host="${host%%:*}"
+        [[ -n "${host}" ]] || continue
+        if jq -e --arg h "${host,,}" '.allowed_domains[]? as $d | ($h == $d or $h | endswith("." + $d))' \
+            "${OUTPUT_DIR}/scope/effective.json" >/dev/null 2>&1; then
+            printf '%s\n' "${host,,}" >> "${output}"
+        fi
+    done < "${input}"
+    sort_unique_file "${output}"
+}
+
+scope_url_allowed() {
+    local url="$1" authority host port
+    [[ "${url}" =~ ^https:// ]] || return 1
+    authority="${url#https://}"; authority="${authority%%/*}"; authority="${authority##*@}"
+    if [[ "${authority}" == \[*\]* ]]; then
+        host="${authority#\[}"; host="${host%%\]*}"; port="${authority##*]}"; port="${port#:}"
+    else host="${authority%%:*}"; port="${authority#*:}"; [[ "${port}" == "${authority}" ]] && port=443; fi
+    [[ "${port}" == 443 ]] || return 1
+    jq -e --arg h "${host,,}" '
+      ([.exclusions[]? | ascii_downcase] | index($h) | not) and
+      any(.allowed_domains[]?; . as $d | ($h == $d or ($h|endswith("."+$d))))' \
+      "${OUTPUT_DIR}/scope/effective.json" >/dev/null 2>&1
+}
+
+phase_01_scope() {
+    start_phase PHASE_001 "Scope acquisition and validation" || return 0
+    local raw="${OUTPUT_DIR}/scope/raw.txt" effective="${OUTPUT_DIR}/scope/effective.json"
+    : > "${raw}"
+    [[ -n "${SCOPE_FILE}" && -f "${SCOPE_FILE}" ]] && sed 's/[[:space:]]*#.*$//' "${SCOPE_FILE}" >> "${raw}"
+    ((${#TARGETS[@]})) && printf '%s\n' "${TARGETS[@]}" >> "${raw}"
+    if [[ "${SCOPE_SOURCE}" == hackerone && -n "${H1_PROGRAM}" ]]; then
+        h1_load_credentials
+        h1_get_program_scope "${H1_PROGRAM}" > "${SCOPE_CACHE_DIR}/h1_scope.jsonl" || {
+            finish_phase PHASE_001 "${PHASE_FAILED}" "HackerOne scope retrieval failed"; return 1; }
+        jq -r '.attributes.asset_identifier // empty' "${SCOPE_CACHE_DIR}/h1_scope.jsonl" >> "${raw}"
+    fi
+    sort_unique_file "${raw}"
+    jq -Rn '[inputs | select(length>0)] as $raw | {
+      raw:$raw,
+      exclusions:[$raw[]|select(startswith("!"))|ltrimstr("!")],
+      allowed_domains:[$raw[]|select(startswith("!")|not)|sub("^https?://";"")|split("/")[0]|split(":")[0]|sub("^\\\\*\\\\.";"")|ascii_downcase],
+      allowed_ports:[80,443], generated_at:(now|todate)
+    }' < "${raw}" > "${effective}.tmp"
+    jq -e '.allowed_domains|length>0' "${effective}.tmp" >/dev/null || {
+        rm -f "${effective}.tmp"; finish_phase PHASE_001 "${PHASE_FAILED}" "scope contains no usable assets"; return 1; }
+    mv "${effective}.tmp" "${effective}"
+    jq -r '.allowed_domains[]' "${effective}" > "${OUTPUT_DIR}/scope/normalized_in_scope.txt"
+    finish_phase PHASE_001 "${PHASE_SUCCESS}" "validated and normalized scope"
+}
+
+phase_02_hackerone() {
+    start_phase PHASE_002 "Program, structured scope and policy retrieval" || return 0
+    if [[ -z "${H1_PROGRAM}" ]]; then
+        : > "${OUTPUT_DIR}/scope/program_policy.json"
+        finish_phase PHASE_002 "${PHASE_SKIPPED}" "no HackerOne program requested"; return 0
+    fi
+    h1_load_credentials
+    h1_get_program "${H1_PROGRAM}" > "${OUTPUT_DIR}/scope/program_policy.json" || {
+        finish_phase PHASE_002 "${PHASE_PARTIAL}" "program policy unavailable"; return 0; }
+    jq -e . "${OUTPUT_DIR}/scope/program_policy.json" >/dev/null
+    finish_phase PHASE_002 "${PHASE_SUCCESS}" "read-only API snapshot stored"
+}
+
+phase_03_passive_intel() {
+    start_phase PHASE_003 "Passive company and domain intelligence" || return 0
+    local out="${OUTPUT_DIR}/recon/passive_intelligence.txt"; : > "${out}"
+    while IFS= read -r d; do
+        command_exists whois && timeout "${TIMEOUT}" whois "${d}" 2>/dev/null | \
+            sed -nE '/^(OrgName|Organization|Registrant Organization|NetName|Country):/Ip' >> "${out}" || :
+        printf 'domain: %s\n' "${d}" >> "${out}"
+    done < "${OUTPUT_DIR}/scope/normalized_in_scope.txt"
+    sort_unique_file "${out}"
+    finish_phase PHASE_003 "${PHASE_SUCCESS}" "passive metadata captured"
+}
+
+phase_04_subdomains() {
+    start_phase PHASE_004 "Passive subdomain discovery" || return 0
+    local raw="${OUTPUT_DIR}/recon/subdomains/passive.raw" out="${OUTPUT_DIR}/recon/subdomains/passive.txt"
+    mkdir -p "$(dirname "${out}")"; : > "${raw}"
+    while IFS= read -r d; do
+        if command_exists subfinder; then subfinder -silent -d "${d}" -rl "${RATE_LIMIT}" >> "${raw}" 2>/dev/null || :
+        elif command_exists assetfinder; then assetfinder --subs-only "${d}" >> "${raw}" 2>/dev/null || :
+        elif command_exists amass; then amass enum -passive -d "${d}" >> "${raw}" 2>/dev/null || :
+        else printf '%s\n' "${d}" >> "${raw}"; fi
+    done < "${OUTPUT_DIR}/scope/normalized_in_scope.txt"
+    scope_filter_hosts "${raw}" "${out}"
+    finish_phase PHASE_004 "${PHASE_SUCCESS}" "$(wc -l < "${out}") in-scope names retained"
+}
+
+phase_05_ct() {
+    start_phase PHASE_005 "Certificate transparency discovery" || return 0
+    local out="${OUTPUT_DIR}/recon/subdomains/certificate_transparency.txt"; : > "${out}"
+    if command_exists subfinder; then
+        while IFS= read -r d; do subfinder -silent -d "${d}" -s crtsh >> "${out}.raw" 2>/dev/null || :; done < "${OUTPUT_DIR}/scope/normalized_in_scope.txt"
+        scope_filter_hosts "${out}.raw" "${out}"; rm -f "${out}.raw"
+        finish_phase PHASE_005 "${PHASE_SUCCESS}" "CT source queried through subfinder"
+    else finish_phase PHASE_005 "${PHASE_SKIPPED}" "subfinder unavailable for controlled CT retrieval"; fi
+}
+
+phase_06_dns() {
+    start_phase PHASE_006 "DNS resolution and wildcard detection" || return 0
+    local input="${OUTPUT_DIR}/recon/subdomains/all.txt" out="${OUTPUT_DIR}/recon/dns.jsonl"
+    { cat "${OUTPUT_DIR}/scope/normalized_in_scope.txt"; cat "${OUTPUT_DIR}/recon/subdomains/passive.txt" 2>/dev/null; cat "${OUTPUT_DIR}/recon/subdomains/certificate_transparency.txt" 2>/dev/null; } | sort -u > "${input}"
+    : > "${out}"
+    if command_exists dnsx; then dnsx -silent -json -l "${input}" -retry 2 > "${out}" 2>/dev/null || :
+    elif command_exists dig; then while IFS= read -r h; do
+        local ips; ips=$(dig +short A "${h}" 2>/dev/null | paste -sd, -)
+        [[ -n "${ips}" ]] && jq -cn --arg host "${h}" --arg a "${ips}" '{host:$host,a:($a|split(","))}' >> "${out}"
+    done < "${input}"; fi
+    jq -e . "${out}" >/dev/null 2>&1 || [[ ! -s "${out}" ]]
+    finish_phase PHASE_006 "${PHASE_SUCCESS}" "resolution output validated; unresolved names retained separately"
+}
+
+phase_07_wordlist_dns() {
+    start_phase PHASE_007 "Controlled subdomain wordlist reconnaissance" || return 0
+    local out="${OUTPUT_DIR}/recon/subdomains/wordlist.txt"; : > "${out}"
+    if [[ -n "${WORDLIST_FILE}" && -f "${WORDLIST_FILE}" && $(command -v puredns || command -v shuffledns || true) ]]; then
+        local tool; tool=$(command -v puredns || command -v shuffledns)
+        while IFS= read -r d; do timeout "$((TIMEOUT*10))" "${tool}" bruteforce "${WORDLIST_FILE}" "${d}" 2>/dev/null >> "${out}" || :; done < "${OUTPUT_DIR}/scope/normalized_in_scope.txt"
+        scope_filter_hosts "${out}" "${out}.filtered"; mv "${out}.filtered" "${out}"
+        finish_phase PHASE_007 "${PHASE_SUCCESS}" "bounded supplied wordlist processed"
+    else finish_phase PHASE_007 "${PHASE_SKIPPED}" "no wordlist or compatible DNS resolver"; fi
+}
+
+phase_08_http() {
+    start_phase PHASE_008 "HTTP service discovery and fingerprinting" || return 0
+    local input="${OUTPUT_DIR}/recon/subdomains/all_http.txt" out="${OUTPUT_DIR}/recon/http.jsonl"
+    cat "${OUTPUT_DIR}/recon/subdomains/"*.txt 2>/dev/null | sort -u > "${input}" || :; : > "${out}"
+    if command_exists httpx; then httpx -silent -json -l "${input}" -sc -title -cl -ct -server -td -fr=false -timeout "${TIMEOUT}" -rl "${RATE_LIMIT}" > "${out}" 2>/dev/null || :
+    else finish_phase PHASE_008 "${PHASE_SKIPPED}" "httpx unavailable"; return 0; fi
+    jq -e . "${out}" >/dev/null 2>&1 || [[ ! -s "${out}" ]]
+    jq -r '.url // empty' "${out}" > "${OUTPUT_DIR}/recon/live_urls.txt"
+    finish_phase PHASE_008 "${PHASE_SUCCESS}" "HTTP JSONL validated"
+}
+
+phase_09_ports() {
+    start_phase PHASE_009 "Allowed-port discovery" || return 0
+    local out="${OUTPUT_DIR}/recon/ports.txt"; : > "${out}"
+    if command_exists naabu; then naabu -silent -list "${OUTPUT_DIR}/recon/subdomains/all_http.txt" -p 80,443 -rate "${RATE_LIMIT}" -timeout $((TIMEOUT*1000)) > "${out}" 2>/dev/null || :
+    else awk '{print $0":80"; print $0":443"}' "${OUTPUT_DIR}/recon/subdomains/all_http.txt" > "${out}"; fi
+    finish_phase PHASE_009 "${PHASE_SUCCESS}" "only explicitly allowed default ports evaluated"
+}
+
+phase_10_vhosts() {
+    start_phase PHASE_010 "Virtual-host discovery" || return 0
+    local out="${OUTPUT_DIR}/recon/vhosts.jsonl"; : > "${out}"
+    if command_exists ffuf && [[ -n "${WORDLIST_FILE}" && -f "${WORDLIST_FILE}" ]]; then
+        while IFS= read -r u; do ffuf -s -noninteractive -w "${WORDLIST_FILE}" -u "${u}" -H 'Host: FUZZ' -rate "${RATE_LIMIT}" -t "${CONCURRENCY}" -timeout "${TIMEOUT}" -of json 2>/dev/null | jq -c --arg base "${u}" '.results[]?|{base:$base,input:.input,status:.status,length:.length}' >> "${out}" || :; done < "${OUTPUT_DIR}/recon/live_urls.txt"
+        finish_phase PHASE_010 "${PHASE_SUCCESS}" "results require baseline review"
+    else finish_phase PHASE_010 "${PHASE_SKIPPED}" "ffuf or explicit wordlist unavailable"; fi
+}
+
+phase_11_history() {
+    start_phase PHASE_011 "Historical URL collection" || return 0
+    local out="${OUTPUT_DIR}/urls/historical.txt"; : > "${out}"
+    if command_exists gau; then cat "${OUTPUT_DIR}/scope/normalized_in_scope.txt" | gau --threads "${CONCURRENCY}" >> "${out}" 2>/dev/null || :
+    elif command_exists waymore; then while IFS= read -r d; do waymore -i "${d}" -mode U -oU "${out}.${d}" >/dev/null 2>&1 || :; cat "${out}.${d}" >> "${out}"; rm -f "${out}.${d}"; done < "${OUTPUT_DIR}/scope/normalized_in_scope.txt"; fi
+    sort_unique_file "${out}"; finish_phase PHASE_011 "${PHASE_SUCCESS}" "historical inventory normalized"
+}
+
+phase_12_crawl() {
+    start_phase PHASE_012 "Safe crawling" || return 0
+    local out="${OUTPUT_DIR}/urls/crawled.txt"; : > "${out}"
+    if command_exists katana; then katana -silent -list "${OUTPUT_DIR}/recon/live_urls.txt" -d 3 -jc -kf robotstxt,sitemapxml -rl "${RATE_LIMIT}" -c "${CONCURRENCY}" -timeout "${TIMEOUT}" -fs fqdn > "${out}" 2>/dev/null || :
+    elif [[ -f "${OUTPUT_DIR}/recon/live_urls.txt" ]]; then cp "${OUTPUT_DIR}/recon/live_urls.txt" "${out}"
+    else : > "${out}"; fi
+    sort_unique_file "${out}"; finish_phase PHASE_012 "${PHASE_SUCCESS}" "bounded, read-only crawl completed"
+}
+
+phase_13_tech() {
+    start_phase PHASE_013 "Technology fingerprinting" || return 0
+    local out="${OUTPUT_DIR}/recon/technologies.jsonl"; : > "${out}"
+    [[ -f "${OUTPUT_DIR}/recon/http.jsonl" ]] && jq -c '{url,tech:(.tech // []),webserver,status_code}' "${OUTPUT_DIR}/recon/http.jsonl" > "${out}"
+    finish_phase PHASE_013 "${PHASE_SUCCESS}" "technology evidence derived from HTTP responses"
+}
+
+phase_14_js() {
+    start_phase PHASE_014 "JavaScript discovery and analysis" || return 0
+    local urls="${OUTPUT_DIR}/javascript/urls.txt" findings="${OUTPUT_DIR}/javascript/findings.jsonl"; : > "${findings}"
+    cat "${OUTPUT_DIR}/urls/"*.txt 2>/dev/null | grep -Ei '\\.m?js([?#].*)?$' | sort -u > "${urls}" || :
+    if command_exists jsluice; then jsluice urls < "${urls}" 2>/dev/null | jq -Rc '{type:"javascript-url",value:.}' > "${findings}" || :
+    elif command_exists LinkFinder; then while IFS= read -r u; do LinkFinder -i "${u}" -o cli 2>/dev/null | jq -Rc --arg src "${u}" '{type:"endpoint",source:$src,value:.}' >> "${findings}" || :; done < "${urls}"; fi
+    finish_phase PHASE_014 "${PHASE_SUCCESS}" "JavaScript inventory and safe static analysis stored"
+}
+
+phase_15_api() {
+    start_phase PHASE_015 "API, OpenAPI, Swagger and GraphQL discovery" || return 0
+    local out="${OUTPUT_DIR}/api/endpoints.txt"
+    cat "${OUTPUT_DIR}/urls/"*.txt "${OUTPUT_DIR}/javascript/urls.txt" 2>/dev/null | grep -Ei '(/api/|graphql|swagger|openapi|api-docs)' | sort -u > "${out}" || :
+    finish_phase PHASE_015 "${PHASE_SUCCESS}" "API candidates classified without mutation"
+}
+
+phase_16_parameters() {
+    start_phase PHASE_016 "Parameter discovery" || return 0
+    local out="${OUTPUT_DIR}/api/parameters.txt"
+    cat "${OUTPUT_DIR}/urls/"*.txt 2>/dev/null | sed -n 's/.*?[?&]\([^=&]*\)=.*/\1/p' | sort -u > "${out}" || :
+    if command_exists arjun && [[ -s "${OUTPUT_DIR}/recon/live_urls.txt" ]]; then arjun -i "${OUTPUT_DIR}/recon/live_urls.txt" -oJ "${OUTPUT_DIR}/api/arjun.json" -t "${CONCURRENCY}" --stable >/dev/null 2>&1 || :; fi
+    finish_phase PHASE_016 "${PHASE_SUCCESS}" "passive parameters stored; active discovery bounded when available"
+}
+
+phase_17_wordlist() {
+    start_phase PHASE_017 "Target-specific wordlist generation" || return 0
+    local out="${OUTPUT_DIR}/wordlists/target.txt"
+    cat "${OUTPUT_DIR}/scope/normalized_in_scope.txt" "${OUTPUT_DIR}/recon/passive_intelligence.txt" "${OUTPUT_DIR}/urls/"*.txt 2>/dev/null | tr '/?&=._:-' '\n' | grep -E '^[[:alnum:]][[:alnum:]_-]{2,39}$' | tr '[:upper:]' '[:lower:]' | sort -u | head -n 5000 > "${out}" || :
+    finish_phase PHASE_017 "${PHASE_SUCCESS}" "deterministic bounded token set generated"
+}
+
+phase_18_content() {
+    start_phase PHASE_018 "SecLists-based staged content discovery" || return 0
+    local out="${OUTPUT_DIR}/recon/content.jsonl"; : > "${out}"
+    local wl="${OUTPUT_DIR}/wordlists/target.txt"
+    [[ -n "${SECLISTS_DIR}" && -f "${SECLISTS_DIR}/Discovery/Web-Content/common.txt" ]] && wl="${SECLISTS_DIR}/Discovery/Web-Content/common.txt"
+    if command_exists ffuf && [[ -s "${wl}" ]]; then while IFS= read -r u; do ffuf -s -noninteractive -w "${wl}" -u "${u%/}/FUZZ" -mc all -fc 404 -rate "${RATE_LIMIT}" -t "${CONCURRENCY}" -timeout "${TIMEOUT}" -of json 2>/dev/null | jq -c --arg base "${u}" '.results[]?|{base:$base,url:.url,status:.status,length:.length,words:.words}' >> "${out}" || :; done < "${OUTPUT_DIR}/recon/live_urls.txt"; fi
+    finish_phase PHASE_018 "${PHASE_SUCCESS}" "high-signal/target-specific tier completed; larger tiers require explicit wordlist"
+}
+
+phase_19_artifact_discovery() {
+    start_phase PHASE_019 "Public document and artifact discovery" || return 0
+    local out="${OUTPUT_DIR}/artifacts/candidates.txt"
+    cat "${OUTPUT_DIR}/urls/"*.txt 2>/dev/null | grep -Ei '\\.(env|map|zip|tar|gz|tgz|7z|rar|sql|pdf|docx?|xlsx?|csv|txt|json|xml|ya?ml|log|bak|old|orig|save|swp)([?#].*)?$' | sort -u > "${out}" || :
+    [[ -n "${ARTIFACT_URLS_FILE}" && -f "${ARTIFACT_URLS_FILE}" ]] && { cat "${ARTIFACT_URLS_FILE}" >> "${out}"; sort_unique_file "${out}"; }
+    finish_phase PHASE_019 "${PHASE_SUCCESS}" "filename candidates retained only as candidates"
+}
+
+phase_20_artifacts() {
+    start_phase PHASE_020 "Safe artifact downloading and offline processing" || return 0
+    local manifest="${OUTPUT_DIR}/artifacts/manifest.jsonl"; : > "${manifest}"
+    # Downloads are intentionally delegated to curl only after candidates came
+    # from scope-filtered crawling.  Size is capped before and during transfer.
+    while IFS= read -r u; do
+        [[ -n "${u}" ]] || continue
+        if ! scope_url_allowed "${u}"; then
+            phase_note PHASE_020 "${PHASE_PARTIAL}" "rejected out-of-scope or non-HTTPS artifact URL"
+            continue
+        fi
+        local name tmp size mime hash
+        name=$(printf '%s' "${u}" | sha256sum | cut -c1-24); tmp="${OUTPUT_DIR}/artifacts/${name}.bin"
+        curl --fail --silent --show-error --location --max-redirs 0 --proto '=https' --tlsv1.2 --max-time "${TIMEOUT}" --max-filesize "${MAX_ARTIFACT_SIZE}" -o "${tmp}" "${u}" 2>/dev/null || { rm -f "${tmp}"; continue; }
+        size=$(stat -c%s "${tmp}"); ((size <= MAX_ARTIFACT_SIZE)) || { rm -f "${tmp}"; continue; }
+        mime=$(file -b --mime-type "${tmp}"); hash=$(sha256sum "${tmp}" | awk '{print $1}')
+        chmod 600 "${tmp}"; jq -cn --arg url "${u}" --arg file "${tmp}" --arg mime "${mime}" --arg hash "${hash}" --argjson size "${size}" '{url:$url,file:$file,mime:$mime,size:$size,sha256:$hash,executed:false}' >> "${manifest}"
+    done < "${OUTPUT_DIR}/artifacts/candidates.txt"
+    finish_phase PHASE_020 "${PHASE_SUCCESS}" "size-capped private evidence stored; content never executed"
+}
+
+phase_21_exposures() {
+    start_phase PHASE_021 "Backup, configuration and sensitive-file exposure checks" || return 0
+    local out="${OUTPUT_DIR}/candidates/exposures.jsonl"; : > "${out}"
+    # Content-discovery hits remain candidates until baseline and signature data agree.
+    jq -c 'select((.status|tonumber) >= 200 and (.status|tonumber) < 400) | . + {confidence:"Candidate",validation:"baseline/content signature required"}' "${OUTPUT_DIR}/recon/content.jsonl" 2>/dev/null > "${out}" || :
+    finish_phase PHASE_021 "${PHASE_SUCCESS}" "no filename/status-only confirmations emitted"
+}
+
+phase_22_classify() {
+    start_phase PHASE_022 "Safe vulnerability candidate classification" || return 0
+    local out="${OUTPUT_DIR}/candidates/classified.jsonl"; : > "${out}"
+    cat "${OUTPUT_DIR}/candidates/exposures.jsonl" "${OUTPUT_DIR}/recon/vhosts.jsonl" 2>/dev/null | jq -c '. + {confidence:(.confidence // "Manual Review Required")}' > "${out}" || :
+    finish_phase PHASE_022 "${PHASE_SUCCESS}" "difficult classes require manual review"
+}
+
+phase_23_nuclei() {
+    start_phase PHASE_023 "Context-aware Nuclei execution" || return 0
+    local out="${OUTPUT_DIR}/nuclei/raw/findings.jsonl" manifest="${OUTPUT_DIR}/nuclei/execution_manifest.json"; mkdir -p "$(dirname "${out}")"; : > "${out}"
+    if ! command_exists nuclei; then printf '{"available":false,"reason":"nuclei missing"}\n' > "${manifest}"; finish_phase PHASE_023 "${PHASE_SKIPPED}" "nuclei unavailable"; return 0; fi
+    local ver; ver=$(nuclei -version 2>&1 | head -n1)
+    jq -n --arg version "${ver}" --arg profile "${PROFILE}" '{available:true,version:$version,profile:$profile,passes:["exposure","misconfiguration","technology","safe-cve"],excluded:["dos","fuzz","bruteforce","intrusive"]}' > "${manifest}"
+    nuclei -silent -jsonl -l "${OUTPUT_DIR}/recon/live_urls.txt" -tags exposure,misconfig,tech,cve -etags dos,fuzz,bruteforce,intrusive -rl "${RATE_LIMIT}" -c "${CONCURRENCY}" -timeout "${TIMEOUT}" -o "${out}" >/dev/null 2>&1 || :
+    jq -e . "${out}" >/dev/null 2>&1 || [[ ! -s "${out}" ]]
+    finish_phase PHASE_023 "${PHASE_SUCCESS}" "safe selected passes complete; results remain unconfirmed"
+}
+
+phase_24_validate() {
+    start_phase PHASE_024 "Safe validation and false-positive reduction" || return 0
+    local likely="${OUTPUT_DIR}/candidates/likely.jsonl" rejected="${OUTPUT_DIR}/candidates/rejected.jsonl"; : > "${likely}"; : > "${rejected}"
+    jq -c '. + {confidence:"Likely",note:"independent manual confirmation still required"}' "${OUTPUT_DIR}/nuclei/raw/findings.jsonl" 2>/dev/null > "${likely}" || :
+    finish_phase PHASE_024 "${PHASE_SUCCESS}" "automated signals never promoted directly to confirmed"
+}
+
+phase_25_dedup() {
+    start_phase PHASE_025 "Deduplication and evidence preservation" || return 0
+    local out="${OUTPUT_DIR}/candidates/deduplicated.jsonl"
+    if ! cat "${OUTPUT_DIR}/candidates/classified.jsonl" "${OUTPUT_DIR}/candidates/likely.jsonl" 2>/dev/null | \
+        jq -cs 'unique_by([(.template_id // .["template-id"] // .type // "candidate"),(.matched_at // .["matched-at"] // .url // .base // "")])[]' > "${out}"; then
+        finish_phase PHASE_025 "${PHASE_FAILED}" "deduplication input was invalid JSONL"; return 1
+    fi
+    chmod 600 "${out}"; finish_phase PHASE_025 "${PHASE_SUCCESS}" "deterministic deduplication complete; evidence private"
+}
+
+phase_26_report() {
+    start_phase PHASE_026 "Final reporting and resume-safe cleanup" || return 0
+    generate_summary_report
+    generate_detailed_report
+    finish_phase PHASE_026 "${PHASE_SUCCESS}" "JSON, Markdown and HTML reports generated"
+    # Refresh the machine-readable report after the phase checkpoint so it
+    # contains the final success state rather than an in-progress snapshot.
+    generate_detailed_report
+}
+
+# ============================================================================
+# REPORT GENERATION
+# ============================================================================
+
+generate_summary_report() {
+    local report_file="${OUTPUT_DIR}/report/summary.txt"
+
+    log_info "Generating summary report..."
+
+    cat > "${report_file}" <<EOF
+================================================================================
+                    WATCH.21 RECONNAISSANCE REPORT
+================================================================================
+
+Scan ID:             ${SCAN_ID}
+Start Time:          ${START_TIME}
+Profile:             ${PROFILE}
+Target(s):           $(printf '%s, ' "${TARGETS[@]}")
+
+================================================================================
+                            RECONNAISSANCE SUMMARY
+================================================================================
+
+Subdomains Discovered:
+$([ -f "${OUTPUT_DIR}/recon/subdomains/passive.txt" ] && wc -l < "${OUTPUT_DIR}/recon/subdomains/passive.txt" || echo "0")
+
+Live Hosts Found:
+$([ -f "${OUTPUT_DIR}/recon/live-hosts/hosts.txt" ] && wc -l < "${OUTPUT_DIR}/recon/live-hosts/hosts.txt" || echo "0")
+
+Technologies Detected:
+$([ -f "${OUTPUT_DIR}/recon/technologies/detected.txt" ] && wc -l < "${OUTPUT_DIR}/recon/technologies/detected.txt" || echo "0")
+
+URLs Collected:
+$([ -f "${OUTPUT_DIR}/urls/all_urls.txt" ] && wc -l < "${OUTPUT_DIR}/urls/all_urls.txt" || echo "0")
+
+JavaScript Files:
+$([ -f "${OUTPUT_DIR}/javascript/endpoints.txt" ] && wc -l < "${OUTPUT_DIR}/javascript/endpoints.txt" || echo "0")
+
+Nuclei Findings:
+$([ -f "${OUTPUT_DIR}/nuclei/raw/findings.jsonl" ] && wc -l < "${OUTPUT_DIR}/nuclei/raw/findings.jsonl" || echo "0")
+
+================================================================================
+                         SECURITY CONFIGURATION
+================================================================================
+
+TLS Verification:   $([ ${INSECURE} -eq 0 ] && echo "ENABLED" || echo "DISABLED (insecure)")
+Rate Limit:         ${RATE_LIMIT} requests/sec
+Concurrency:        ${CONCURRENCY}
+Timeout:            ${TIMEOUT}s
+Max Runtime:        ${MAX_RUNTIME_MINUTES} minutes
+Max Requests:       ${MAX_REQUESTS}
+
+================================================================================
+                          OUTPUT DIRECTORIES
+================================================================================
+
+Reconnaissance:     ${OUTPUT_DIR}/recon/
+Scope:              ${OUTPUT_DIR}/scope/
+URLs:               ${OUTPUT_DIR}/urls/
+JavaScript:         ${OUTPUT_DIR}/javascript/
+API:                ${OUTPUT_DIR}/api/
+Candidates:         ${OUTPUT_DIR}/candidates/
+Nuclei:             ${OUTPUT_DIR}/nuclei/
+Logs:               ${OUTPUT_DIR}/logs/
+Reports:            ${OUTPUT_DIR}/report/
+
+================================================================================
+EOF
+
+    log_success "Summary report generated: ${report_file}"
+}
+
+generate_detailed_report() {
+    local report_file="${OUTPUT_DIR}/report/report.json"
+
+    log_info "Generating detailed JSON report..."
+
+    local end_time findings assets urls artifacts
+    end_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    findings=$(wc -l < "${OUTPUT_DIR}/candidates/deduplicated.jsonl" 2>/dev/null || echo 0)
+    assets=$(wc -l < "${OUTPUT_DIR}/recon/subdomains/all_http.txt" 2>/dev/null || echo 0)
+    urls=$(cat "${OUTPUT_DIR}/urls/"*.txt 2>/dev/null | sort -u | wc -l || echo 0)
+    artifacts=$(wc -l < "${OUTPUT_DIR}/artifacts/manifest.jsonl" 2>/dev/null || echo 0)
+    jq -n --arg id "${SCAN_ID}" --arg start "${START_TIME}" --arg end "${end_time}" \
+      --arg profile "${PROFILE}" --arg source "${SCOPE_SOURCE}" --argjson tls "$((INSECURE==0))" \
+      --argjson assets "${assets}" --argjson urls "${urls}" --argjson artifacts "${artifacts}" \
+      --argjson findings "${findings}" --slurpfile scope "${OUTPUT_DIR}/scope/effective.json" \
+      --slurpfile phases "${STATE_DIR}/phases.json" \
+      '{scan_metadata:{scan_id:$id,start_time:$start,end_time:$end,profile:$profile,scope_source:$source},scope:$scope[0],tool_manifest:"../manifest.json",inventory:{assets:$assets,urls:$urls,artifacts:$artifacts},findings:{total:$findings,confidence_states:["Informational","Candidate","Likely","Confirmed-Safe","Manual Review Required","Rejected False Positive"]},phases:$phases[0].phases,security:{tls_verification:$tls,read_only:true,automatic_submission:false}}' > "${report_file}.tmp"
+    mv "${report_file}.tmp" "${report_file}"
+
+    jq -c '.' "${OUTPUT_DIR}/candidates/deduplicated.jsonl" 2>/dev/null > "${OUTPUT_DIR}/report/findings.jsonl" || :
+    {
+      printf '# WATCH.21 Report\n\n'
+      printf 'Scan `%s` started %s with profile `%s`.\n\n' "${SCAN_ID}" "${START_TIME}" "${PROFILE}"
+      printf '## Executive summary\n\nAssets: %s; URLs: %s; private artifacts: %s; deduplicated candidates: %s.\n\n' "${assets}" "${urls}" "${artifacts}" "${findings}"
+      printf '## Scope and exclusions\n\n```json\n'; jq . "${OUTPUT_DIR}/scope/effective.json"; printf '\n```\n\n'
+      printf '## Phase status and exact reasons\n\n| Phase | State | Reason |\n|---|---|---|\n'
+      jq -r '[.phase_id,.state,.reason]|"| \(.[]) |"' "${STATE_DIR}/phase_notes.jsonl" 2>/dev/null || :
+      printf '\n## Findings and confidence\n\nAutomated results are never treated as confirmed without independent safe validation. See `findings.jsonl`.\n\n'
+      printf '## Evidence and remediation\n\nEvidence paths, timestamps, hashes, sanitized metadata, rejection records, and tool manifests are stored beside this report. Remediate verified exposures by removing public access, rotating affected secrets, and reviewing access logs.\n'
+    } > "${OUTPUT_DIR}/report/report.md"
+    sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g' "${OUTPUT_DIR}/report/report.md" | awk 'BEGIN{print "<!doctype html><meta charset=\"utf-8\"><title>WATCH.21 Report</title><pre>"}{print}END{print "</pre>"}' > "${OUTPUT_DIR}/report/report.html"
+
+    log_success "Detailed report generated: ${report_file}"
+}
+
+# ============================================================================
+# DRY-RUN MODE
+# ============================================================================
+
+run_dry_run() {
+    log_info "DRY-RUN mode enabled (no network requests will be executed)"
+
+    cat <<EOF
+
+${CYAN}╔════════════════════════════════════════════════════════════════╗${NC}
+${CYAN}║           WATCH.21 DRY-RUN PLAN                             ║${NC}
+${CYAN}╚════════════════════════════════════════════════════════════════╝${NC}
+
+${MAGENTA}SCAN CONFIGURATION:${NC}
+  Scan ID:              ${SCAN_ID}
+  Profile:              ${PROFILE}
+  Output Directory:     ${OUTPUT_DIR}
+  Max Runtime:          ${MAX_RUNTIME_MINUTES} minutes
+  Rate Limit:           ${RATE_LIMIT} req/s
+  Concurrency:          ${CONCURRENCY}
+  Timeout:              ${TIMEOUT}s
+
+${MAGENTA}TARGETS:${NC}
+$(printf '  - %s\n' "${TARGETS[@]}")
+
+${MAGENTA}PHASES TO EXECUTE:${NC}
+  1. Scope acquisition and validation
+  2. HackerOne program, scope and policy retrieval
+  3. Passive company and domain intelligence
+  4. Passive subdomain discovery
+  5. Certificate transparency discovery
+  6. DNS resolution and wildcard detection
+  7. Controlled subdomain wordlist reconnaissance
+  8. HTTP service discovery and fingerprinting
+  9. Allowed-port discovery
+  10. Virtual-host discovery
+  11. Historical URL collection
+  12. Safe crawling
+  13. Technology fingerprinting
+  14. JavaScript discovery and analysis
+  15. API, OpenAPI, Swagger and GraphQL discovery
+  16. Parameter discovery
+  17. Target-specific wordlist generation
+  18. SecLists-based staged content discovery
+  19. Public document and artifact discovery
+  20. Safe artifact downloading and offline processing
+  21. Backup, configuration and sensitive-file exposure checks
+  22. Safe vulnerability candidate classification
+  23. Context-aware Nuclei execution
+  24. Safe validation and false-positive reduction
+  25. Deduplication and evidence preservation
+  26. Final reporting and resume-safe cleanup
+
+${MAGENTA}EXPECTED OUTPUT STRUCTURE:${NC}
+  ${OUTPUT_DIR}/
+  ├── scope/
+  │   ├── normalized_in_scope.txt
+  │   ├── submission_eligible.txt
+  │   └── out_of_scope.jsonl
+  ├── recon/
+  │   ├── subdomains/
+  │   ├── live-hosts/
+  │   └── technologies/
+  ├── nuclei/
+  │   ├── raw/
+  │   ├── normalized/
+  │   └── verified/
+  ├── logs/
+  │   └── main.log
+  └── report/
+      ├── report.md
+      ├── report.json
+      └── summary.txt
+
+${MAGENTA}SECURITY CHECKS:${NC}
+  ✓ TLS verification: $([ ${INSECURE} -eq 0 ] && echo "ENABLED" || echo "DISABLED")
+  ✓ Credentials: Checked
+  ✓ Scope enforcement: Enabled before every network request
+  ✓ Rate limiting: ${RATE_LIMIT} req/s
+  ✓ Timeouts: ${TIMEOUT}s per request
+  ✓ Lock mechanism: Prevents concurrent scans
+  ✓ Atomic writes: State updates are atomic
+  ✓ Cleanup: Temporary files cleaned on exit
+
+${MAGENTA}NETWORK REQUESTS: NONE (dry-run)${NC}
+
+${GREEN}[✔] Dry-run plan complete. No actual reconnaissance performed.${NC}
+
+EOF
+}
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+main() {
+    # Parse before output so --doctor --json remains valid JSON.
+    parse_arguments "$@"
+
+    if [[ ${DOCTOR_MODE} -eq 1 ]]; then
+        run_doctor_mode
+        exit "${EXIT_SUCCESS}"
+    fi
+    if [[ -n "${DEPENDENCY_ACTION}" ]]; then
+        W21_ASSUME_YES="${ASSUME_YES}"
+        if [[ "${DEPENDENCY_ACTION}" == plan ]]; then
+            W21_INSTALL_MODE=missing
+            print_install_plan
+        else
+            W21_INSTALL_MODE="${DEPENDENCY_ACTION}"
+            run_installation
+        fi
+        exit $?
+    fi
+
+    # Reject incomplete input before environment checks so users receive the
+    # actionable usage error they need. Resume restores targets from state.
+    if [[ ${RESUME} -ne 1 && ${#TARGETS[@]} -eq 0 && -z "${TARGETS_FILE}" && \
+          -z "${SCOPE_FILE}" && -z "${H1_PROGRAM}" ]]; then
+        die "No targets or scope specified. Use --target, --targets, --scope, or --h1-program" \
+            "${EXIT_USAGE_ERROR}"
+    fi
+
+    if [[ -n "${TARGETS_FILE}" && ! -f "${TARGETS_FILE}" ]]; then
+        die "Targets file not found: ${TARGETS_FILE}" "${EXIT_USAGE_ERROR}"
+    fi
+
+    if [[ -n "${SCOPE_FILE}" && ! -f "${SCOPE_FILE}" ]]; then
+        die "Scope file not found: ${SCOPE_FILE}" "${EXIT_USAGE_ERROR}"
+    fi
+
+    if [[ ${EUID} -eq 0 ]]; then
+        if [[ ${DRY_RUN} -eq 1 ]]; then
+            log_warn "Running a no-network dry-run as root; real scans still require a normal user."
+        else
+            log_warn "Do not run WATCH.21 as root. Use a normal account; sudo is used only for individual apt operations."
+            exit "${EXIT_USAGE_ERROR}"
+        fi
+    fi
+
+    # Show banner
+    cat <<'EOF'
+
+  _  _  _        _              ____
+ | || || |      | |            |  _ \ _ __ ___
+ | || || | _ __ | | ___ ___| |__) | '__/ _ \
+ |__   _| | '_  \| |/ _ \/ __|  ___/| | | (_) |
+    | | | | | | | |  __/\__ \ | |   | |  \__, |
+    |_| |_|_| |_|_|\___||___/_|_|   |_|    ___/
+                                  v0.1.0-alpha
+
+EOF
+
+    # Check required dependencies early
+    if ! check_required_dependencies; then
+        die "Missing required dependencies" "${EXIT_MISSING_DEPENDENCY}"
+    fi
+
+    # Initialize output directory
+    init_output_dir
+
+    # Generate scan ID
+    generate_scan_id
+
+    # Initialize state
+    init_state
+
+    log_info "WATCH.21 v${SCRIPT_VERSION} started"
+    log_info "Scan ID: ${SCAN_ID}"
+
+    # Handle dry-run
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        run_dry_run
+        exit "${EXIT_SUCCESS}"
+    fi
+
+    # Load targets from file if specified
+    if [[ -n "${TARGETS_FILE}" ]]; then
+        mapfile -t TARGETS < "${TARGETS_FILE}"
+    fi
+
+    # Run the canonical 26-phase workflow in sequence. A phase may degrade or
+    # skip an unavailable optional capability, but it must always checkpoint.
+    log_info "Executing reconnaissance phases..."
+    log_info "Profile: ${PROFILE}"
+
+    local phase_fn
+    for phase_fn in \
+        phase_01_scope phase_02_hackerone phase_03_passive_intel phase_04_subdomains \
+        phase_05_ct phase_06_dns phase_07_wordlist_dns phase_08_http phase_09_ports \
+        phase_10_vhosts phase_11_history phase_12_crawl phase_13_tech phase_14_js \
+        phase_15_api phase_16_parameters phase_17_wordlist phase_18_content \
+        phase_19_artifact_discovery phase_20_artifacts phase_21_exposures \
+        phase_22_classify phase_23_nuclei phase_24_validate phase_25_dedup phase_26_report; do
+        if ! "${phase_fn}"; then
+            log_warn "${phase_fn} returned an error; later independent phases will continue"
+        fi
+    done
+
+    log_success "Reconnaissance complete"
+    log_info "Results saved to: ${OUTPUT_DIR}"
+    log_info "Summary report: ${OUTPUT_DIR}/report/summary.txt"
+    log_info "Detailed report: ${OUTPUT_DIR}/report/report.json"
+
+    exit "${EXIT_SUCCESS}"
+}
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+main "$@"

@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  bash-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify runtime tools
+        run: |
+          command -v bash
+          command -v jq
+      - name: Syntax checks
+        run: bash -n w21 lib/dependency-installer.sh install.sh tests.sh tests/*.sh
+      - name: Main offline suite
+        run: ./tests.sh
+      - name: Installer offline suite
+        run: ./tests/offline-installer-tests.sh
+      - name: Installed command layout
+        run: ./tests/install-layout-tests.sh

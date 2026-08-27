@@ -1,0 +1,51 @@
+# WATCH.21 Configuration File
+
+# Target configuration
+targets="example.com example.org"  # Space-separated targets
+targets_file=""                    # Alternative: file with targets (one per line)
+
+# Scope configuration
+scope_file=""                      # Custom scope file
+scope_source="file"               # file or hackerone
+h1_program=""                     # HackerOne program handle
+h1_credentials_file=""            # Path to credentials file
+h1_refresh_minutes=60             # API refresh interval for long scans
+bounty_only=0                     # 1 = only scan bounty-eligible assets
+
+# Scanning profile
+profile="safe"                    # safe or standard
+
+# Output and logging
+output_dir="results/default"      # Output directory
+log_level="info"                  # info, debug, warn, error
+
+# Resource limits
+rate_limit=50                     # Requests per second
+concurrency=10                    # Concurrent tasks
+timeout=30                        # Timeout per request (seconds)
+max_runtime_minutes=10080         # 7 days default
+max_requests=100000               # Total requests cap
+max_feedback_rounds=5             # Mutation feedback loops
+max_artifact_size=104857600       # 100 MB in bytes
+
+# Wordlist and SecLists
+seclists_dir=""                   # Path to SecLists
+wordlist_file=""                  # Custom wordlist
+artifact_urls_file=""             # File with artifact URLs to scan
+
+# Nuclei configuration
+update_templates=0                # 1 = update Nuclei templates
+nuclei_tags=""                    # Custom Nuclei tags
+
+# Options
+resume=0                          # 1 = resume previous scan
+force_phase=""                    # Force re-run specific phase (e.g., PHASE_025)
+skip_phases=""                    # Space-separated phase IDs to skip
+dry_run=0                         # 1 = show plan without executing
+doctor_mode=0                     # 1 = run diagnostics
+insecure=0                        # 1 = disable TLS verification (INSECURE!)
+non_interactive=0                 # 1 = no prompts
+
+# Advanced options
+debug=0                           # 1 = verbose debug output
+keep_temp_files=0                 # 1 = keep temporary files after completion

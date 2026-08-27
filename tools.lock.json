@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "description": "Tested dependency pins. Runtime detections and installation timestamps are written to $XDG_STATE_HOME/w21/tools.lock.json.",
+  "tools": [
+    {"tool":"subfinder","source":"github.com/projectdiscovery/subfinder","install_method":"go","tested_version":"v2.6.6","executable":"subfinder","checksum":null,"installation_timestamp":null,"detected_version":null,"upgrade_status":"unknown"},
+    {"tool":"httpx","source":"github.com/projectdiscovery/httpx","install_method":"go","tested_version":"v1.6.10","executable":"httpx","checksum":null,"installation_timestamp":null,"detected_version":null,"upgrade_status":"unknown"},
+    {"tool":"nuclei","source":"github.com/projectdiscovery/nuclei","install_method":"go","tested_version":"v3.3.7","executable":"nuclei","checksum":null,"installation_timestamp":null,"detected_version":null,"upgrade_status":"unknown"},
+    {"tool":"nuclei-templates","source":"github.com/projectdiscovery/nuclei-templates","install_method":"git","tested_version":"v10.1.4","executable":"__nuclei_templates__","checksum":null,"installation_timestamp":null,"detected_version":null,"upgrade_status":"unknown"}
+  ]
+}

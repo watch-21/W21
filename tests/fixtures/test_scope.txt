@@ -1,0 +1,4 @@
+example.com
+*.example.com
+!admin.example.com
+https://api.example.com/v1/

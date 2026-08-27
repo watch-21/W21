@@ -1,0 +1,48 @@
+# Example Scope File for WATCH.21
+#
+# Scope files define the authorized testing boundary.
+# This is a HARD SAFETY boundary — WATCH.21 will reject any out-of-scope target.
+#
+# Supported formats:
+# - Exact domains:      example.com
+# - Wildcard domains:   *.example.com
+# - CIDR blocks:        192.168.0.0/24 (when explicitly enabled)
+# - Exact URLs:         https://example.com/api/v1/
+# - Exclusions:         !internal.example.com
+#
+# IMPORTANT: This scope is derived from your HackerOne program policy,
+# bug bounty agreement, or explicit authorization. Always verify scope
+# with your point of contact before testing.
+
+# Primary domain and subdomains
+example.com
+*.example.com
+
+# Specific subdomains if wildcard is too broad
+api.example.com
+app.example.com
+staging.example.com
+
+# Full URLs if only specific paths are in scope
+https://example.com/api/
+https://api.example.com/v1/
+
+# Exclude admin/internal interfaces
+!admin.example.com
+!internal.example.com
+!vpn.example.com
+
+# IPv4 examples (when in scope)
+# 203.0.113.0/24
+# 192.0.2.100
+
+# IPv6 examples (when in scope)
+# 2001:db8::/32
+# 2001:db8::1
+
+# Notes:
+# - All domains are normalized to lowercase
+# - Subdomains must match exactly or be covered by wildcard
+# - URLs are path-sensitive (https://example.com/api/ ≠ https://example.com/admin/)
+# - Out-of-scope requests are logged and rejected with reason
+# - IDN domains are converted to Punycode automatically
